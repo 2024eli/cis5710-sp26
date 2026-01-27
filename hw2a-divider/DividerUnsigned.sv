@@ -1,5 +1,5 @@
-/* Name: Faiyaz Hasan */
-/* PennKey: faiyazhasan */
+/* Name: Faiyaz Hasan and Evelyn Li */
+/* PennKey: faiyazhasan and 2024eli */
 
 `timescale 1ns / 1ns
 
@@ -66,16 +66,10 @@ module DividerOneIter (
         dividend = dividend << 1;
     }
     */
-
-    wire [31:0] remainder_next;
-    wire [30:0] rem_shifted;
-    wire div_msb;
-    
-    assign rem_shifted = i_remainder[30:0];
-    assign div_msb = i_dividend[31];
     
     // remainder = (remainder << 1) | ((dividend >> 31) & 0x1);
-    assign remainder_next = {rem_shifted, div_msb};
+    wire [31:0] remainder_next;
+    assign remainder_next = (i_remainder << 1) | i_dividend[31];
 
     // if (remainder < divisor) ... else ...
     wire [30:0] quot_shifted;
