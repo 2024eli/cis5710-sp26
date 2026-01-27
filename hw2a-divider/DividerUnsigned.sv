@@ -79,9 +79,7 @@ module DividerOneIter (
     assign o_remainder = (remainder_next < i_divisor) ? remainder_next : (remainder_next - i_divisor);
     
     // dividend = dividend << 1;
-    wire [30:0] div_shifted;
-    assign div_shifted = i_dividend[30:0];
-    assign o_dividend = {div_shifted, 1'b0};
+    assign o_dividend = i_dividend << 1;
     /* verilator lint_on WIDTH */
 
 endmodule
