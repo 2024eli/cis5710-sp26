@@ -46,7 +46,7 @@ module rca4(input wire [3:0]  a,
             output wire       carry_out);
    wire cout0;
    fulladder2 a0(.cin(1'b0), .a(a[1:0]), .b(b[1:0]), .s(sum[1:0]), .cout(cout0));
-   fulladder2 a3(.cin(cout0), .a(a[3:2]), .b(b[3:2]), .s(sum[3:2]), .cout(carry_out));
+   fulladder2 a1(.cin(cout0), .a(a[3:2]), .b(b[3:2]), .s(sum[3:2]), .cout(carry_out));
 endmodule
 
 /** 
