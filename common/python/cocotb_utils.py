@@ -12,7 +12,8 @@ VERILATOR_FLAGS = [
     '-Wno-DECLFILENAME',
     '--trace',
     '--trace-fst',
-    '--trace-structs',
+    '--trace-structs', 
+    '-CFLAGS', '-std=c++17',
     # NB: --trace-max-array must be ≥ size of the memory (in 4B words) for memory to appear in the waveforms
     '--trace-max-array',str(2**18)
     ]

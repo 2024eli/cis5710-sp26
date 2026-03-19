@@ -7,10 +7,11 @@ import logging
 import cocotb, cocotbext
 
 # readelf program
-READELF = 'riscv64-unknown-elf-readelf'
+# readelf program
+READELF = 'riscv-none-elf-readelf'
 
 # assembler program
-ASSEMBLER = 'riscv64-unknown-elf-as'
+ASSEMBLER = 'riscv-none-elf-as'
 
 # temporary file used to hold assembler output
 TEMP_MACHINE_CODE_FILE = ".tmp.riscv.o"
@@ -18,8 +19,10 @@ TEMP_MACHINE_CODE_FILE = ".tmp.riscv.o"
 # offset to map from standard Linux/ELF addresses to what our processor's memory uses
 BIN_2_MEMORY_ADDRESS_OFFSET = 0x80000000
 
-assert shutil.which(ASSEMBLER) is not None, f"Couldn't find assembler program {ASSEMBLER}"
-assert shutil.which(READELF) is not None, f"Couldn't find readelf program {READELF}"
+if shutil.which(ASSEMBLER) is None:
+    print(f"WARNING: Couldn't find assembler program {ASSEMBLER}")
+if shutil.which(READELF) is None:
+    print(f"WARNING: Couldn't find readelf program {READELF}")
 
 LOG = logging.getLogger('riscv_binary_utils')
 LOG.setLevel(logging.INFO)

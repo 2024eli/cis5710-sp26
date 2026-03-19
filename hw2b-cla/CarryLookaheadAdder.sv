@@ -73,7 +73,6 @@ module gp8(input wire [7:0] gin, pin,
                   | (p[7] & p[6] & p[5] & p[4] & p[3] & p[2] & p[1] & g[0]);
    assign pout = &p;
 
-
 endmodule
 
 module CarryLookaheadAdder
@@ -136,6 +135,5 @@ module CarryLookaheadAdder
    assign cbit[31:25] = c3_int; 
 
    assign sum = a ^ b ^ cbit;
-
 
 endmodule
