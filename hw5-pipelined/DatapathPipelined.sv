@@ -195,6 +195,9 @@ module DatapathPipelined (
     if (rst) begin
       f_pc_current   <= 32'd0;
       f_cycle_status <= CYCLE_RESET;
+    end else if (halt) begin
+      f_pc_current   <= f_pc_current;
+      f_cycle_status <= f_cycle_status;
     end else if (x_redirect_taken) begin
       f_pc_current   <= x_redirect_target;
       f_cycle_status <= CYCLE_TAKEN_BRANCH;
@@ -584,7 +587,7 @@ module DatapathPipelined (
   assign addr_to_dmem       = 32'b0;
   assign store_data_to_dmem = 32'b0;
   assign store_we_to_dmem   = 4'b0000;
-  assign halt               = 1'b0;
+  assign halt = (w_state.insn == 32'h00000073);
 
   /********************/
   /* TRACE OUTPUTS    */
