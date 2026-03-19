@@ -188,21 +188,19 @@ module DatapathPipelined (
   wire  [`INSN_SIZE] f_insn;
   cycle_status_e f_cycle_status;
 
-  wire m_redirect_taken;
-  wire [`REG_SIZE] m_redirect_target;
+  wire x_redirect_taken;
+  wire [`REG_SIZE] x_redirect_target;
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      f_pc_current    <= 32'd0;
-      f_cycle_status  <= CYCLE_NO_STALL;
+      f_pc_current   <= 32'd0;
+      f_cycle_status <= CYCLE_RESET;
+    end else if (x_redirect_taken) begin
+      f_pc_current   <= x_redirect_target;
+      f_cycle_status <= CYCLE_TAKEN_BRANCH;
     end else begin
-      if (x_redirect_taken) begin
-        f_pc_current   <= x_redirect_target;
-        f_cycle_status <= CYCLE_NO_STALL;
-      end else begin
-        f_pc_current   <= f_pc_current + 4;
-        f_cycle_status <= CYCLE_NO_STALL;
-      end
+      f_pc_current   <= f_pc_current + 4;
+      f_cycle_status <= CYCLE_NO_STALL;
     end
   end
 
@@ -239,7 +237,7 @@ module DatapathPipelined (
       decode_state <= '{
         pc: f_pc_current,
         insn: f_insn,
-        cycle_status: f_cycle_status
+        cycle_status: CYCLE_NO_STALL
       };
     end
   end
@@ -287,12 +285,19 @@ module DatapathPipelined (
     imm_u = {insn[31:12], 12'b0};
   endfunction
 
+  function automatic logic [`REG_SIZE] imm_j(input logic [`INSN_SIZE] insn);
+    imm_j = {{11{insn[31]}}, insn[31], insn[19:12], insn[20], insn[30:21], 1'b0};
+  endfunction
+
   logic [`REG_SIZE] d_imm;
   always_comb begin
     unique case (d_opcode)
       OpcodeRegImm: d_imm = imm_i(decode_state.insn);
       OpcodeBranch: d_imm = imm_b(decode_state.insn);
       OpcodeLui:    d_imm = imm_u(decode_state.insn);
+      OpcodeAuipc:  d_imm = imm_u(decode_state.insn);
+      OpcodeJal:    d_imm = imm_j(decode_state.insn);
+      OpcodeJalr:   d_imm = imm_i(decode_state.insn);
       default:      d_imm = '0;
     endcase
   end
@@ -302,90 +307,112 @@ module DatapathPipelined (
   /*****************/
   stage_execute_t x_state, x_state_next;
 
-  // M/X and W/X bypass
+  // X/M and M/X and W/X bypass
   logic [`REG_SIZE] x_src1, x_src2;
   always_comb begin
-    x_src1 = x_state.rs1_val;
-    x_src2 = x_state.rs2_val;
+    x_src1 = rf_rs1_data;
+    x_src2 = rf_rs2_data;
 
-    // MX bypass has priority over WX
-    if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == x_state.rs1)) begin
+    // rs1 bypass: priority from most recent stage to oldest
+    if (x_state.regwrite && (x_state.rd != 5'd0) && (x_state.rd == d_rs1)) begin
+      x_src1 = x_state.alu_result;
+    end else if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == d_rs1)) begin
       x_src1 = m_state.result;
-    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == x_state.rs1)) begin
+    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs1)) begin
       x_src1 = w_state.result;
     end
 
-    if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == x_state.rs2)) begin
+    // rs2 bypass: priority from most recent stage to oldest
+    if (x_state.regwrite && (x_state.rd != 5'd0) && (x_state.rd == d_rs2)) begin
+      x_src2 = x_state.alu_result;
+    end else if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == d_rs2)) begin
       x_src2 = m_state.result;
-    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == x_state.rs2)) begin
+    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs2)) begin
       x_src2 = w_state.result;
     end
   end
 
-  logic x_branch_taken_calc;
-  logic [`REG_SIZE] x_branch_target_calc;
+  logic d_branch_taken_calc;
+  logic [`REG_SIZE] d_branch_target_calc;
   logic [`REG_SIZE] x_alu_result_calc;
 
   always_comb begin
-    x_branch_taken_calc  = 1'b0;
-    x_branch_target_calc = x_state.pc + x_state.imm;
+    d_branch_taken_calc  = 1'b0;
+    d_branch_target_calc = decode_state.pc + d_imm;
     x_alu_result_calc    = '0;
 
-    unique case (x_state.insn[6:0])
+    unique case (decode_state.insn[6:0])
 
       OpcodeLui: begin
-        x_alu_result_calc = x_state.imm;
+        x_alu_result_calc = d_imm;
+      end
+
+      OpcodeAuipc: begin
+        x_alu_result_calc = decode_state.pc + d_imm;
+      end
+
+      OpcodeJal: begin
+        // rd = PC+4 (return address), jump to PC+imm_j
+        x_alu_result_calc    = decode_state.pc + 32'd4;
+        d_branch_taken_calc  = 1'b1;
+        d_branch_target_calc = decode_state.pc + d_imm;
+      end
+
+      OpcodeJalr: begin
+        // rd = PC+4, jump to (rs1 + imm_i) & ~1
+        x_alu_result_calc    = decode_state.pc + 32'd4;
+        d_branch_taken_calc  = 1'b1;
+        d_branch_target_calc = (x_src1 + d_imm) & ~32'd1;
       end
 
       OpcodeRegImm: begin
-        unique case (x_state.insn[14:12])
-          3'b000: x_alu_result_calc = x_src1 + x_state.imm;                      // ADDI
-          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_state.imm))};  // SLTI
-          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_state.imm)};                     // SLTIU
-          3'b100: x_alu_result_calc = x_src1 ^ x_state.imm;                      // XORI
-          3'b110: x_alu_result_calc = x_src1 | x_state.imm;                      // ORI
-          3'b111: x_alu_result_calc = x_src1 & x_state.imm;                      // ANDI
-          3'b001: x_alu_result_calc = x_src1 << x_state.insn[24:20];             // SLLI
+        unique case (decode_state.insn[14:12])
+          3'b000: x_alu_result_calc = x_src1 + d_imm;
+          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(d_imm))};
+          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < d_imm)};
+          3'b100: x_alu_result_calc = x_src1 ^ d_imm;
+          3'b110: x_alu_result_calc = x_src1 | d_imm;
+          3'b111: x_alu_result_calc = x_src1 & d_imm;
+          3'b001: x_alu_result_calc = x_src1 << decode_state.insn[24:20];
           3'b101: begin
-            if (x_state.insn[30]) begin
-              x_alu_result_calc = $signed(x_src1) >>> x_state.insn[24:20];       // SRAI
-            end else begin
-              x_alu_result_calc = x_src1 >> x_state.insn[24:20];                 // SRLI
-            end
+            if (decode_state.insn[30])
+              x_alu_result_calc = $signed(x_src1) >>> decode_state.insn[24:20];
+            else
+              x_alu_result_calc = x_src1 >> decode_state.insn[24:20];
           end
           default: x_alu_result_calc = '0;
         endcase
       end
 
       OpcodeRegReg: begin
-        unique case (x_state.insn[14:12])
+        unique case (decode_state.insn[14:12])
           3'b000: begin
-            if (x_state.insn[30]) x_alu_result_calc = x_src1 - x_src2;           // SUB
-            else                  x_alu_result_calc = x_src1 + x_src2;           // ADD
+            if (decode_state.insn[30]) x_alu_result_calc = x_src1 - x_src2;
+            else                       x_alu_result_calc = x_src1 + x_src2;
           end
-          3'b001: x_alu_result_calc = x_src1 << x_src2[4:0];                     // SLL
-          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_src2))}; // SLT
-          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_src2)};                     // SLTU
-          3'b100: x_alu_result_calc = x_src1 ^ x_src2;                           // XOR
+          3'b001: x_alu_result_calc = x_src1 << x_src2[4:0];
+          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_src2))};
+          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_src2)};
+          3'b100: x_alu_result_calc = x_src1 ^ x_src2;
           3'b101: begin
-            if (x_state.insn[30]) x_alu_result_calc = $signed(x_src1) >>> x_src2[4:0]; // SRA
-            else                  x_alu_result_calc = x_src1 >> x_src2[4:0];            // SRL
+            if (decode_state.insn[30]) x_alu_result_calc = $signed(x_src1) >>> x_src2[4:0];
+            else                       x_alu_result_calc = x_src1 >> x_src2[4:0];
           end
-          3'b110: x_alu_result_calc = x_src1 | x_src2;                           // OR
-          3'b111: x_alu_result_calc = x_src1 & x_src2;                           // AND
+          3'b110: x_alu_result_calc = x_src1 | x_src2;
+          3'b111: x_alu_result_calc = x_src1 & x_src2;
           default: x_alu_result_calc = '0;
         endcase
       end
 
       OpcodeBranch: begin
-        unique case (x_state.insn[14:12])
-          3'b000: x_branch_taken_calc = (x_src1 == x_src2);                      // BEQ
-          3'b001: x_branch_taken_calc = (x_src1 != x_src2);                      // BNE
-          3'b100: x_branch_taken_calc = ($signed(x_src1) <  $signed(x_src2));    // BLT
-          3'b101: x_branch_taken_calc = ($signed(x_src1) >= $signed(x_src2));    // BGE
-          3'b110: x_branch_taken_calc = (x_src1 < x_src2);                       // BLTU
-          3'b111: x_branch_taken_calc = (x_src1 >= x_src2);                      // BGEU
-          default: x_branch_taken_calc = 1'b0;
+        unique case (decode_state.insn[14:12])
+          3'b000: d_branch_taken_calc = (x_src1 == x_src2);
+          3'b001: d_branch_taken_calc = (x_src1 != x_src2);
+          3'b100: d_branch_taken_calc = ($signed(x_src1) <  $signed(x_src2));
+          3'b101: d_branch_taken_calc = ($signed(x_src1) >= $signed(x_src2));
+          3'b110: d_branch_taken_calc = (x_src1 < x_src2);
+          3'b111: d_branch_taken_calc = (x_src1 >= x_src2);
+          default: d_branch_taken_calc = 1'b0;
         endcase
         x_alu_result_calc = '0;
       end
@@ -407,28 +434,23 @@ module DatapathPipelined (
     x_state_next.rs1          = d_rs1;
     x_state_next.rs2          = d_rs2;
     x_state_next.rd           = d_rd;
-    x_state_next.regwrite     = 1'b0;
-    x_state_next.is_branch    = 1'b0;
-    x_state_next.branch_taken = 1'b0;
-    x_state_next.branch_target= '0;
-    x_state_next.alu_result   = '0;
+
+    x_state_next.branch_taken  = d_branch_taken_calc;
+    x_state_next.branch_target = d_branch_target_calc;
+    x_state_next.alu_result    = x_alu_result_calc;
+
+    x_state_next.regwrite  = 1'b0;
+    x_state_next.is_branch = 1'b0;
 
     unique case (d_opcode)
-      OpcodeLui: begin
-        x_state_next.regwrite = (d_rd != 5'd0);
-      end
-      OpcodeRegImm: begin
-        x_state_next.regwrite = (d_rd != 5'd0);
-      end
-      OpcodeRegReg: begin
-        x_state_next.regwrite = (d_rd != 5'd0);
-      end
-      OpcodeBranch: begin
-        x_state_next.is_branch = 1'b1;
-      end
-      default: begin
-        x_state_next.regwrite = 1'b0;
-      end
+      OpcodeLui:    x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeAuipc:  x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeJal:    x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeJalr:   x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeRegImm: x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeRegReg: x_state_next.regwrite = (d_rd != 5'd0);
+      OpcodeBranch: x_state_next.is_branch = 1'b1;
+      default:      x_state_next.regwrite = 1'b0;
     endcase
   end
 
@@ -437,7 +459,7 @@ module DatapathPipelined (
       x_state <= '{
         pc: 0,
         insn: 0,
-        cycle_status: CYCLE_RESET,
+        cycle_status: CYCLE_RESET,  
         rs1_val: 0,
         rs2_val: 0,
         imm: 0,
@@ -451,7 +473,6 @@ module DatapathPipelined (
         alu_result: 0
       };
     end else if (x_redirect_taken) begin
-      // flush younger insn entering X
       x_state <= '{
         pc: 0,
         insn: 32'b0,
@@ -470,9 +491,6 @@ module DatapathPipelined (
       };
     end else begin
       x_state <= x_state_next;
-      x_state.branch_taken  <= x_branch_taken_calc;
-      x_state.branch_target <= x_branch_target_calc;
-      x_state.alu_result    <= x_alu_result_calc;
     end
   end
 
@@ -506,15 +524,12 @@ module DatapathPipelined (
         cycle_status: x_state.cycle_status,
         rd: x_state.rd,
         regwrite: x_state.regwrite,
-        result: x_alu_result_calc,
-        branch_taken: x_branch_taken_calc,
-        branch_target: x_branch_target_calc
+        result: x_state.alu_result,   
+        branch_taken: x_state.branch_taken,  
+        branch_target: x_state.branch_target 
       };
     end
   end
-
-  wire x_redirect_taken;
-  wire [`REG_SIZE] x_redirect_target;
 
   assign x_redirect_taken  = x_state.branch_taken;
   assign x_redirect_target = x_state.branch_target;
