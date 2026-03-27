@@ -111,6 +111,7 @@ typedef struct packed {
   logic [4:0] rs1;
   logic [4:0] rs2;
   logic [4:0] rd;
+  logic [2:0] funct3;
 
   logic regwrite;
   logic is_branch;
@@ -118,12 +119,23 @@ typedef struct packed {
   logic [`REG_SIZE] branch_target;
 
   logic [`REG_SIZE] alu_result;
+  
+  logic is_load;
+  logic is_store;
+  logic is_div_insn;
 } stage_execute_t;
 
 typedef struct packed {
   logic [`REG_SIZE] pc;
   logic [`INSN_SIZE] insn;
   cycle_status_e cycle_status;
+
+  logic [4:0] rs2;
+  logic [`REG_SIZE] rs2_val;
+  logic [2:0] funct3;
+
+  logic is_load;
+  logic is_store;
 
   logic [4:0] rd;
   logic regwrite;
@@ -141,7 +153,18 @@ typedef struct packed {
   logic [4:0] rd;
   logic regwrite;
   logic [`REG_SIZE] result;
+  logic is_load;
 } stage_writeback_t;
+
+typedef struct packed {
+  logic valid;
+  logic [4:0] rd;
+  logic quotient_sign;
+  logic remainder_sign;
+  logic is_rem;
+  logic [`REG_SIZE] pc;
+  logic [`INSN_SIZE] insn;
+} div_track_t;
 
 module DatapathPipelined (
     input wire clk,
@@ -184,6 +207,9 @@ module DatapathPipelined (
   /***************/
   /* FETCH STAGE */
   /***************/
+  logic d_stall;
+  logic inflight_div_exists;
+  
   logic [`REG_SIZE] f_pc_current;
   wire  [`INSN_SIZE] f_insn;
   cycle_status_e f_cycle_status;
@@ -201,6 +227,9 @@ module DatapathPipelined (
     end else if (x_redirect_taken) begin
       f_pc_current   <= x_redirect_target;
       f_cycle_status <= CYCLE_TAKEN_BRANCH;
+    end else if (d_stall) begin
+      f_pc_current   <= f_pc_current;
+      f_cycle_status <= f_cycle_status;
     end else begin
       f_pc_current   <= f_pc_current + 4;
       f_cycle_status <= CYCLE_NO_STALL;
@@ -236,6 +265,8 @@ module DatapathPipelined (
         insn: 32'b0,
         cycle_status: CYCLE_TAKEN_BRANCH
       };
+    end else if (d_stall) begin
+      decode_state <= decode_state;
     end else begin
       decode_state <= '{
         pc: f_pc_current,
@@ -280,6 +311,10 @@ module DatapathPipelined (
     imm_i = {{20{insn[31]}}, insn[31:20]};
   endfunction
 
+  function automatic logic [`REG_SIZE] imm_s(input logic [`INSN_SIZE] insn);
+    imm_s = {{20{insn[31]}}, insn[31:25], insn[11:7]};
+  endfunction
+
   function automatic logic [`REG_SIZE] imm_b(input logic [`INSN_SIZE] insn);
     imm_b = {{19{insn[31]}}, insn[31], insn[7], insn[30:25], insn[11:8], 1'b0};
   endfunction
@@ -301,197 +336,122 @@ module DatapathPipelined (
       OpcodeAuipc:  d_imm = imm_u(decode_state.insn);
       OpcodeJal:    d_imm = imm_j(decode_state.insn);
       OpcodeJalr:   d_imm = imm_i(decode_state.insn);
+      OpcodeLoad:   d_imm = imm_i(decode_state.insn);
+      OpcodeStore:  d_imm = imm_s(decode_state.insn);
       default:      d_imm = '0;
     endcase
   end
+
+  wire d_is_load  = (d_opcode == OpcodeLoad);
+  wire d_is_store = (d_opcode == OpcodeStore);
+  wire d_is_div   = (d_opcode == OpcodeRegReg) && (d_funct7 == 7'd1) && (d_funct3 >= 3'b100);
+
+  logic d_uses_rs1, d_uses_rs2;
+  always_comb begin
+    d_uses_rs1 = 1'b0; d_uses_rs2 = 1'b0;
+    unique case (d_opcode)
+      OpcodeBranch, OpcodeStore, OpcodeRegReg: begin
+        d_uses_rs1 = 1'b1; d_uses_rs2 = 1'b1;
+      end
+      OpcodeLoad, OpcodeJalr, OpcodeRegImm: begin
+        d_uses_rs1 = 1'b1;
+      end
+      default: ;
+    endcase
+  end
+
+  wire load_use_hazard = x_state.is_load && x_state.regwrite && (x_state.rd != 5'd0) &&
+    ( (d_uses_rs1 && (d_rs1 == x_state.rd)) ||
+      (d_uses_rs2 && (d_rs2 == x_state.rd) && !d_is_store) );
+
+  div_track_t div_pipe[7];
+  
+  logic d_depends_on_div;
+  always_comb begin
+    d_depends_on_div = 1'b0;
+    if (x_state.is_div_insn && (x_state.rd != 5'd0)) begin
+      if ((d_uses_rs1 && d_rs1 == x_state.rd) || (d_uses_rs2 && d_rs2 == x_state.rd)) d_depends_on_div = 1'b1;
+    end
+    for (int i=0; i<6; i++) begin // ONLY CHECK UP TO div_pipe[5]! div_pipe[6] result goes to M, so X can bypass it!
+      if (div_pipe[i].valid && div_pipe[i].rd != 5'd0) begin
+        if ((d_uses_rs1 && d_rs1 == div_pipe[i].rd) || (d_uses_rs2 && d_rs2 == div_pipe[i].rd)) d_depends_on_div = 1'b1;
+      end
+    end
+  end
+
+  logic div_in_early;
+  always_comb begin
+    div_in_early = x_state.is_div_insn;
+    for (int i=0; i<6; i++) if (div_pipe[i].valid) div_in_early = 1'b1; // up to div_pipe[5]
+  end
+
+  // Ensure fully in-order completion: ANY instruction following a division must stall until div leaves div_pipe[5].
+  // Dependent instructions don't need additional stalling because they will be in X when div is in M, 
+  // and X bypasses perfectly from M!
+  wire d_stall_div = d_depends_on_div || (!d_is_div && div_in_early);
+  assign d_stall = load_use_hazard || d_stall_div;
 
   /*****************/
   /* EXECUTE STAGE */
   /*****************/
   stage_execute_t x_state, x_state_next;
 
-  // X/M and M/X and W/X bypass
-  logic [`REG_SIZE] x_src1, x_src2;
+  // WD bypass only (since X, M bypasses will happen in X stage)
+  logic [`REG_SIZE] d_rs1_val, d_rs2_val;
   always_comb begin
-    x_src1 = rf_rs1_data;
-    x_src2 = rf_rs2_data;
+    d_rs1_val = rf_rs1_data;
+    d_rs2_val = rf_rs2_data;
 
-    // rs1 bypass: priority from most recent stage to oldest
-    if (x_state.regwrite && (x_state.rd != 5'd0) && (x_state.rd == d_rs1)) begin
-      x_src1 = x_state.alu_result;
-    end else if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == d_rs1)) begin
-      x_src1 = m_state.result;
-    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs1)) begin
-      x_src1 = w_state.result;
+    // WD bypass: if W is writing to rs1/rs2, grab it right now.
+    if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs1)) begin
+      d_rs1_val = w_state.result;
     end
-
-    // rs2 bypass: priority from most recent stage to oldest
-    if (x_state.regwrite && (x_state.rd != 5'd0) && (x_state.rd == d_rs2)) begin
-      x_src2 = x_state.alu_result;
-    end else if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == d_rs2)) begin
-      x_src2 = m_state.result;
-    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs2)) begin
-      x_src2 = w_state.result;
+    if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == d_rs2)) begin
+      d_rs2_val = w_state.result;
     end
   end
 
-  logic d_branch_taken_calc;
-  logic [`REG_SIZE] d_branch_target_calc;
-  logic [`REG_SIZE] x_alu_result_calc;
-
-  always_comb begin
-    d_branch_taken_calc  = 1'b0;
-    d_branch_target_calc = decode_state.pc + d_imm;
-    x_alu_result_calc    = '0;
-
-    unique case (decode_state.insn[6:0])
-
-      OpcodeLui: begin
-        x_alu_result_calc = d_imm;
-      end
-
-      OpcodeAuipc: begin
-        x_alu_result_calc = decode_state.pc + d_imm;
-      end
-
-      OpcodeJal: begin
-        // rd = PC+4 (return address), jump to PC+imm_j
-        x_alu_result_calc    = decode_state.pc + 32'd4;
-        d_branch_taken_calc  = 1'b1;
-        d_branch_target_calc = decode_state.pc + d_imm;
-      end
-
-      OpcodeJalr: begin
-        // rd = PC+4, jump to (rs1 + imm_i) & ~1
-        x_alu_result_calc    = decode_state.pc + 32'd4;
-        d_branch_taken_calc  = 1'b1;
-        d_branch_target_calc = (x_src1 + d_imm) & ~32'd1;
-      end
-
-      OpcodeRegImm: begin
-        unique case (decode_state.insn[14:12])
-          3'b000: x_alu_result_calc = x_src1 + d_imm;
-          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(d_imm))};
-          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < d_imm)};
-          3'b100: x_alu_result_calc = x_src1 ^ d_imm;
-          3'b110: x_alu_result_calc = x_src1 | d_imm;
-          3'b111: x_alu_result_calc = x_src1 & d_imm;
-          3'b001: x_alu_result_calc = x_src1 << decode_state.insn[24:20];
-          3'b101: begin
-            if (decode_state.insn[30])
-              x_alu_result_calc = $signed(x_src1) >>> decode_state.insn[24:20];
-            else
-              x_alu_result_calc = x_src1 >> decode_state.insn[24:20];
-          end
-          default: x_alu_result_calc = '0;
-        endcase
-      end
-
-      OpcodeRegReg: begin
-        unique case (decode_state.insn[14:12])
-          3'b000: begin
-            if (decode_state.insn[30]) x_alu_result_calc = x_src1 - x_src2;
-            else                       x_alu_result_calc = x_src1 + x_src2;
-          end
-          3'b001: x_alu_result_calc = x_src1 << x_src2[4:0];
-          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_src2))};
-          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_src2)};
-          3'b100: x_alu_result_calc = x_src1 ^ x_src2;
-          3'b101: begin
-            if (decode_state.insn[30]) x_alu_result_calc = $signed(x_src1) >>> x_src2[4:0];
-            else                       x_alu_result_calc = x_src1 >> x_src2[4:0];
-          end
-          3'b110: x_alu_result_calc = x_src1 | x_src2;
-          3'b111: x_alu_result_calc = x_src1 & x_src2;
-          default: x_alu_result_calc = '0;
-        endcase
-      end
-
-      OpcodeBranch: begin
-        unique case (decode_state.insn[14:12])
-          3'b000: d_branch_taken_calc = (x_src1 == x_src2);
-          3'b001: d_branch_taken_calc = (x_src1 != x_src2);
-          3'b100: d_branch_taken_calc = ($signed(x_src1) <  $signed(x_src2));
-          3'b101: d_branch_taken_calc = ($signed(x_src1) >= $signed(x_src2));
-          3'b110: d_branch_taken_calc = (x_src1 < x_src2);
-          3'b111: d_branch_taken_calc = (x_src1 >= x_src2);
-          default: d_branch_taken_calc = 1'b0;
-        endcase
-        x_alu_result_calc = '0;
-      end
-
-      default: begin
-        x_alu_result_calc = '0;
-      end
-    endcase
-  end
-
+  // D stage next-state assignment
   always_comb begin
     x_state_next = '0;
     x_state_next.pc           = decode_state.pc;
     x_state_next.insn         = decode_state.insn;
     x_state_next.cycle_status = decode_state.cycle_status;
-    x_state_next.rs1_val      = rf_rs1_data;
-    x_state_next.rs2_val      = rf_rs2_data;
+    x_state_next.rs1_val      = d_rs1_val;
+    x_state_next.rs2_val      = d_rs2_val;
     x_state_next.imm          = d_imm;
     x_state_next.rs1          = d_rs1;
     x_state_next.rs2          = d_rs2;
     x_state_next.rd           = d_rd;
-
-    x_state_next.branch_taken  = d_branch_taken_calc;
-    x_state_next.branch_target = d_branch_target_calc;
-    x_state_next.alu_result    = x_alu_result_calc;
-
-    x_state_next.regwrite  = 1'b0;
-    x_state_next.is_branch = 1'b0;
+    x_state_next.is_load      = d_is_load;
+    x_state_next.is_store     = d_is_store;
+    x_state_next.is_div_insn  = d_is_div;
+    x_state_next.funct3       = d_funct3;
+    x_state_next.regwrite     = 1'b0;
+    x_state_next.is_branch    = 1'b0;
+    x_state_next.branch_taken = 1'b0;
+    x_state_next.branch_target= 32'b0;
+    x_state_next.alu_result   = 32'b0;
 
     unique case (d_opcode)
-      OpcodeLui:    x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeAuipc:  x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeJal:    x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeJalr:   x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeRegImm: x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeRegReg: x_state_next.regwrite = (d_rd != 5'd0);
-      OpcodeBranch: x_state_next.is_branch = 1'b1;
+      7'b00_000_11: x_state_next.regwrite = (d_rd != 5'd0); // Load
+      7'b01_101_11: x_state_next.regwrite = (d_rd != 5'd0); // Lui
+      7'b00_101_11: x_state_next.regwrite = (d_rd != 5'd0); // Auipc
+      7'b11_011_11: x_state_next.regwrite = (d_rd != 5'd0); // Jal
+      7'b11_001_11: x_state_next.regwrite = (d_rd != 5'd0); // Jalr
+      7'b00_100_11: x_state_next.regwrite = (d_rd != 5'd0); // RegImm
+      7'b01_100_11: x_state_next.regwrite = (d_rd != 5'd0); // RegReg
+      7'b11_000_11: x_state_next.is_branch = 1'b1;         // Branch
       default:      x_state_next.regwrite = 1'b0;
     endcase
   end
-
   always_ff @(posedge clk) begin
     if (rst) begin
-      x_state <= '{
-        pc: 0,
-        insn: 0,
-        cycle_status: CYCLE_RESET,  
-        rs1_val: 0,
-        rs2_val: 0,
-        imm: 0,
-        rs1: 0,
-        rs2: 0,
-        rd: 0,
-        regwrite: 0,
-        is_branch: 0,
-        branch_taken: 0,
-        branch_target: 0,
-        alu_result: 0
-      };
+      x_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_RESET, rs1_val: 0, rs2_val: 0, imm: 0, rs1: 0, rs2: 0, rd: 0, funct3: 0, regwrite: 0, is_branch: 0, branch_taken: 0, branch_target: 0, alu_result: 0, is_load: 0, is_store: 0, is_div_insn: 0};
     end else if (x_redirect_taken) begin
-      x_state <= '{
-        pc: 0,
-        insn: 32'b0,
-        cycle_status: CYCLE_TAKEN_BRANCH,
-        rs1_val: 0,
-        rs2_val: 0,
-        imm: 0,
-        rs1: 0,
-        rs2: 0,
-        rd: 0,
-        regwrite: 0,
-        is_branch: 0,
-        branch_taken: 0,
-        branch_target: 0,
-        alu_result: 0
-      };
+      x_state <= '{pc: 0, insn: 32'b0, cycle_status: CYCLE_TAKEN_BRANCH, rs1_val: 0, rs2_val: 0, imm: 0, rs1: 0, rs2: 0, rd: 0, funct3: 0, regwrite: 0, is_branch: 0, branch_taken: 0, branch_target: 0, alu_result: 0, is_load: 0, is_store: 0, is_div_insn: 0};
+    end else if (d_stall) begin
+      x_state <= '{pc: 0, insn: 32'b0, cycle_status: (d_stall_div ? CYCLE_DIV : CYCLE_LOAD2USE), rs1_val: 0, rs2_val: 0, imm: 0, rs1: 0, rs2: 0, rd: 0, funct3: 0, regwrite: 0, is_branch: 0, branch_taken: 0, branch_target: 0, alu_result: 0, is_load: 0, is_store: 0, is_div_insn: 0};
     end else begin
       x_state <= x_state_next;
     end
@@ -503,39 +463,244 @@ module DatapathPipelined (
       .disasm(x_disasm)
   );
 
+
+  // M/X and W/X bypass evaluated in X stage!
+  logic [`REG_SIZE] x_src1, x_src2;
+  always_comb begin
+    x_src1 = x_state.rs1_val;
+    x_src2 = x_state.rs2_val;
+
+    // rs1 priority M -> W
+    if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == x_state.rs1)) begin
+      x_src1 = m_state.result;
+    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == x_state.rs1)) begin
+      x_src1 = w_state.result;
+    end
+
+    // rs2 priority M -> W
+    if (m_state.regwrite && (m_state.rd != 5'd0) && (m_state.rd == x_state.rs2)) begin
+      x_src2 = m_state.result;
+    end else if (w_state.regwrite && (w_state.rd != 5'd0) && (w_state.rd == x_state.rs2)) begin
+      x_src2 = w_state.result;
+    end
+  end
+
+  logic x_branch_taken_calc;
+  logic [`REG_SIZE] x_branch_target_calc;
+  logic [`REG_SIZE] x_alu_result_calc;
+  
+  logic [63:0] mul_result;
+  logic signed [63:0] s_alu_a;
+  logic signed [63:0] s_alu_b;
+
+  always_comb begin
+    mul_result = '0;
+    s_alu_a = '0;
+    s_alu_b = '0;
+    x_branch_taken_calc  = 1'b0;
+    x_branch_target_calc = x_state.pc + x_state.imm;
+    x_alu_result_calc    = '0;
+
+    unique case (x_state.insn[6:0])
+      7'b00_000_11, 7'b01_000_11: begin // Load, Store
+        x_alu_result_calc = x_src1 + x_state.imm;
+      end
+
+      7'b01_101_11: begin // Lui
+        x_alu_result_calc = x_state.imm;
+      end
+
+      7'b00_101_11: begin // Auipc
+        x_alu_result_calc = x_state.pc + x_state.imm;
+      end
+
+      7'b11_011_11: begin // Jal
+        x_branch_taken_calc = 1'b1;
+        x_alu_result_calc   = x_state.pc + 4;
+      end
+
+      7'b11_001_11: begin // Jalr
+        x_branch_taken_calc  = 1'b1;
+        x_branch_target_calc = (x_src1 + x_state.imm) & ~32'd1;
+        x_alu_result_calc    = x_state.pc + 4;
+      end
+
+      7'b00_100_11: begin // RegImm
+        unique case (x_state.insn[14:12])
+          3'b000: x_alu_result_calc = x_src1 + x_state.imm;
+          3'b001: x_alu_result_calc = x_src1 << x_state.insn[24:20];
+          3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_state.imm))};
+          3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_state.imm)};
+          3'b100: x_alu_result_calc = x_src1 ^ x_state.imm;
+          3'b101: begin
+            if (x_state.insn[30]) x_alu_result_calc = $signed(x_src1) >>> x_state.insn[24:20];
+            else                       x_alu_result_calc = x_src1 >> x_state.insn[24:20];
+          end
+          3'b110: x_alu_result_calc = x_src1 | x_state.imm;
+          3'b111: x_alu_result_calc = x_src1 & x_state.imm;
+          default: x_alu_result_calc = '0;
+        endcase
+      end
+
+      7'b01_100_11: begin // RegReg
+        if (x_state.insn[31:25] == 7'd1) begin // M-extension
+          if (x_state.insn[14:12] == 3'b001) begin
+            s_alu_a = {{32{x_src1[31]}}, x_src1};
+            s_alu_b = {{32{x_src2[31]}}, x_src2};
+            mul_result = s_alu_a * s_alu_b;
+            x_alu_result_calc = mul_result[63:32];
+          end else if (x_state.insn[14:12] == 3'b010) begin
+            s_alu_a = {{32{x_src1[31]}}, x_src1};
+            s_alu_b = {32'd0, x_src2};
+            mul_result = s_alu_a * s_alu_b;
+            x_alu_result_calc = mul_result[63:32];
+          end else if (x_state.insn[14:12] == 3'b011) begin
+            s_alu_a = {32'd0, x_src1};
+            s_alu_b = {32'd0, x_src2};
+            mul_result = s_alu_a * s_alu_b;
+            x_alu_result_calc = mul_result[63:32];
+          end else if (x_state.insn[14:12] == 3'b000) begin
+            s_alu_a = {32'd0, x_src1};
+            s_alu_b = {32'd0, x_src2};
+            mul_result = s_alu_a * s_alu_b;
+            x_alu_result_calc = mul_result[31:0];
+          end else begin
+            x_alu_result_calc = '0;
+          end
+        end else begin
+          unique case (x_state.insn[14:12])
+            3'b000: begin
+              if (x_state.insn[30]) x_alu_result_calc = x_src1 - x_src2;
+              else                       x_alu_result_calc = x_src1 + x_src2;
+            end
+            3'b001: x_alu_result_calc = x_src1 << x_src2[4:0];
+            3'b010: x_alu_result_calc = {{31{1'b0}}, ($signed(x_src1) < $signed(x_src2))};
+            3'b011: x_alu_result_calc = {{31{1'b0}}, (x_src1 < x_src2)};
+            3'b100: x_alu_result_calc = x_src1 ^ x_src2;
+            3'b101: begin
+              if (x_state.insn[30]) x_alu_result_calc = $signed(x_src1) >>> x_src2[4:0];
+              else                       x_alu_result_calc = x_src1 >> x_src2[4:0];
+            end
+            3'b110: x_alu_result_calc = x_src1 | x_src2;
+            3'b111: x_alu_result_calc = x_src1 & x_src2;
+            default: x_alu_result_calc = '0;
+          endcase
+        end
+      end
+
+      7'b11_000_11: begin // Branch
+        unique case (x_state.insn[14:12])
+          3'b000: x_branch_taken_calc = (x_src1 == x_src2);
+          3'b001: x_branch_taken_calc = (x_src1 != x_src2);
+          3'b100: x_branch_taken_calc = ($signed(x_src1) < $signed(x_src2));
+          3'b101: x_branch_taken_calc = ($signed(x_src1) >= $signed(x_src2));
+          3'b110: x_branch_taken_calc = (x_src1 < x_src2);
+          3'b111: x_branch_taken_calc = (x_src1 >= x_src2);
+          default: x_branch_taken_calc = 1'b0;
+        endcase
+      end
+      default: x_alu_result_calc = '0;
+    endcase
+  end
+
   /****************/
   /* MEMORY STAGE */
   /****************/
   stage_memory_t m_state;
 
+  logic x_is_signed_div, x_is_rem, x_dividend_sign, x_divisor_sign, x_quotient_sign, x_remainder_sign;
+  always_comb begin
+    x_is_signed_div = x_state.is_div_insn && (x_state.funct3 == 3'b100 || x_state.funct3 == 3'b110);
+    x_is_rem = x_state.is_div_insn && (x_state.funct3 == 3'b110 || x_state.funct3 == 3'b111);
+    x_dividend_sign = x_is_signed_div & x_src1[31];
+    x_divisor_sign  = x_is_signed_div & x_src2[31];
+    x_quotient_sign = (x_dividend_sign ^ x_divisor_sign) && (x_src2 != 0);
+    x_remainder_sign = x_dividend_sign;
+  end
+
+  logic [31:0] div_quotient_raw;
+  logic [31:0] div_remainder_raw;
+  logic [31:0] x_div_dividend, x_div_divisor;
+  assign x_div_dividend = x_dividend_sign ? (~x_src1 + 1) : x_src1;
+  assign x_div_divisor  = x_divisor_sign  ? (~x_src2 + 1) : x_src2;
+
+  DividerUnsignedPipelined divider (
+      .clk(clk),
+      .rst(rst),
+      .stall(1'b0),
+      .i_dividend(x_div_dividend),
+      .i_divisor(x_div_divisor),
+      .o_remainder(div_remainder_raw),
+      .o_quotient(div_quotient_raw)
+  );
+
   always_ff @(posedge clk) begin
     if (rst) begin
-      m_state <= '{
-        pc: 0,
-        insn: 0,
-        cycle_status: CYCLE_RESET,
-        rd: 0,
-        regwrite: 0,
-        result: 0,
-        branch_taken: 0,
-        branch_target: 0
-      };
+      for (int i=0; i<7; i++) div_pipe[i] <= '0;
     end else begin
-      m_state <= '{
+      if (x_state.is_div_insn && !x_state.branch_taken) begin
+        div_pipe[0] <= '{valid: 1'b1, rd: x_state.rd, quotient_sign: x_quotient_sign, remainder_sign: x_remainder_sign, is_rem: x_is_rem, pc: x_state.pc, insn: x_state.insn};
+      end else begin
+        div_pipe[0] <= '0;
+      end
+      for (int i=1; i<7; i++) begin
+        div_pipe[i] <= div_pipe[i-1];
+      end
+    end
+  end
+
+  logic [31:0] true_quotient;
+  logic [31:0] true_remainder;
+  logic [31:0] div_result_chosen;
+  assign true_quotient = div_pipe[6].quotient_sign ? (~div_quotient_raw + 1) : div_quotient_raw;
+  assign true_remainder = div_pipe[6].remainder_sign ? (~div_remainder_raw + 1) : div_remainder_raw;
+  assign div_result_chosen = div_pipe[6].is_rem ? true_remainder : true_quotient;
+
+  stage_memory_t m_state_next;
+  always_comb begin
+    if (div_pipe[6].valid) begin
+      m_state_next = '{
+        pc: div_pipe[6].pc,
+        insn: div_pipe[6].insn,
+        cycle_status: CYCLE_NO_STALL,
+        rs2: 0, rs2_val: 0, funct3: 0, is_load: 0, is_store: 0,
+        rd: div_pipe[6].rd,
+        regwrite: 1'b1,
+        result: div_result_chosen,
+        branch_taken: 1'b0,
+        branch_target: '0
+      };
+    end else if (x_state.is_div_insn) begin
+      m_state_next = '{pc: 0, insn: 32'b0, cycle_status: CYCLE_DIV, rs2: 0, rs2_val: 0, funct3: 0, is_load: 0, is_store: 0, rd: 0, regwrite: 0, result: 0, branch_taken: 0, branch_target: 0};
+    end else begin
+      m_state_next = '{
         pc: x_state.pc,
         insn: x_state.insn,
         cycle_status: x_state.cycle_status,
+        rs2: x_state.rs2,
+        rs2_val: x_src2, // Bypassed rs2 goes into memory
+        funct3: x_state.funct3,
+        is_load: x_state.is_load,
+        is_store: x_state.is_store,
         rd: x_state.rd,
         regwrite: x_state.regwrite,
-        result: x_state.alu_result,   
-        branch_taken: x_state.branch_taken,  
-        branch_target: x_state.branch_target 
+        result: x_alu_result_calc, // ALU result calculated in X
+        branch_taken: x_branch_taken_calc,
+        branch_target: x_branch_target_calc
       };
     end
   end
 
-  assign x_redirect_taken  = x_state.branch_taken;
-  assign x_redirect_target = x_state.branch_target;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      m_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_RESET, rs2: 0, rs2_val: 0, funct3: 0, is_load: 0, is_store: 0, rd: 0, regwrite: 0, result: 0, branch_taken: 0, branch_target: 0};
+    end else begin
+      m_state <= m_state_next;
+    end
+  end
+
+  assign x_redirect_taken  = x_branch_taken_calc;
+  assign x_redirect_target = x_branch_target_calc;
 
   wire [255:0] m_disasm;
   Disasm #(.PREFIX("M")) disasm_3memory (
@@ -548,16 +713,47 @@ module DatapathPipelined (
   /*******************/
   stage_writeback_t w_state;
 
+  logic [`REG_SIZE] m_store_data;
+  always_comb begin
+    if (w_state.regwrite && w_state.rd != 5'd0 && w_state.rd == m_state.rs2) begin
+      m_store_data = w_state.result;
+    end else begin
+      m_store_data = m_state.rs2_val;
+    end
+  end
+
+  assign addr_to_dmem = {m_state.result[31:2], 2'b00};
+  assign store_data_to_dmem = m_store_data << {m_state.result[1:0], 3'b000};
+
+  logic [3:0] store_we;
+  always_comb begin
+    store_we = 4'd0;
+    if (m_state.is_store && !rst) begin
+      if (m_state.funct3 == 3'b000) store_we = 4'b0001 << m_state.result[1:0];      // sb
+      else if (m_state.funct3 == 3'b001) store_we = 4'b0011 << m_state.result[1:0]; // sh
+      else if (m_state.funct3 == 3'b010) store_we = 4'b1111;                        // sw
+    end
+  end
+  assign store_we_to_dmem = store_we;
+
+  logic [31:0] shifted_load_data;
+  assign shifted_load_data = load_data_from_dmem >> {m_state.result[1:0], 3'b000};
+  
+  logic [31:0] final_load_data;
+  always_comb begin
+    if (m_state.funct3 == 3'b000) final_load_data = {{24{shifted_load_data[7]}}, shifted_load_data[7:0]};
+    else if (m_state.funct3 == 3'b001) final_load_data = {{16{shifted_load_data[15]}}, shifted_load_data[15:0]};
+    else if (m_state.funct3 == 3'b100) final_load_data = {24'd0, shifted_load_data[7:0]};
+    else if (m_state.funct3 == 3'b101) final_load_data = {16'd0, shifted_load_data[15:0]};
+    else final_load_data = shifted_load_data;
+  end
+
+  logic [31:0] m_result_for_w;
+  assign m_result_for_w = m_state.is_load ? final_load_data : m_state.result;
+
   always_ff @(posedge clk) begin
     if (rst) begin
-      w_state <= '{
-        pc: 0,
-        insn: 0,
-        cycle_status: CYCLE_RESET,
-        rd: 0,
-        regwrite: 0,
-        result: 0
-      };
+      w_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_RESET, rd: 0, regwrite: 0, result: 0, is_load: 0};
     end else begin
       w_state <= '{
         pc: m_state.pc,
@@ -565,7 +761,8 @@ module DatapathPipelined (
         cycle_status: m_state.cycle_status,
         rd: m_state.rd,
         regwrite: m_state.regwrite,
-        result: m_state.result
+        result: m_result_for_w,
+        is_load: m_state.is_load
       };
     end
   end
@@ -576,17 +773,10 @@ module DatapathPipelined (
       .disasm(w_disasm)
   );
 
-  // writeback signals into RF
   assign wb_we   = w_state.regwrite;
   assign wb_rd   = w_state.rd;
   assign wb_data = w_state.result;
 
-  /********************/
-  /* UNUSED FOR M1    */
-  /********************/
-  assign addr_to_dmem       = 32'b0;
-  assign store_data_to_dmem = 32'b0;
-  assign store_we_to_dmem   = 4'b0000;
   assign halt = (w_state.insn == 32'h00000073);
 
   /********************/
