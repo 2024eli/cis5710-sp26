@@ -278,7 +278,7 @@ module DatapathPipelinedAxil (
   stage_g_t g_state;
   always_ff @(posedge clk) begin
     if (rst) begin
-      g_state <= '{pc: 0, cycle_status: CYCLE_IMEM_WAIT};
+      g_state <= '{pc: 0, cycle_status: CYCLE_RESET};
     end else if (halt) begin
       g_state <= g_state;
     end else if (x_redirect_taken) begin
