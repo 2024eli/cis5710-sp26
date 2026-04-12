@@ -313,7 +313,7 @@ module DatapathPipelinedAxil (
       decode_state <= '{
         pc: 0,
         insn: 0,
-        cycle_status: CYCLE_IMEM_WAIT
+        cycle_status: CYCLE_RESET
       };
     end else if (x_redirect_taken) begin
       decode_state <= '{
