@@ -80,7 +80,7 @@ def runCocotbTestsProcessor(pytestconfig):
         waves=cu.shouldGenerateWaveforms(),
         includes=[PROJECT_PATH],
         build_dir=cu.SIM_BUILD_DIR,
-        build_args=cu.VERILATOR_FLAGS+[f'-DDIVIDER_STAGES={DIVIDER_STAGES}'],
+        build_args=cu.VERILATOR_FLAGS+[f'-DDIVIDER_STAGES={DIVIDER_STAGES}', '-Wno-MULTITOP', '-Wno-fatal'],
     )
     runr.test(
         seed=12345,
