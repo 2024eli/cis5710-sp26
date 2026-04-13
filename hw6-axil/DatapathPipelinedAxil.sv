@@ -230,7 +230,7 @@ module DatapathPipelinedAxil (
   /***************/
   logic d_stall;
   logic g_stall;
-  assign g_stall = d_stall;
+  wire f_stall;
   
   logic inflight_div_exists;
   
@@ -239,6 +239,17 @@ module DatapathPipelinedAxil (
 
   wire x_redirect_taken;
   wire [`REG_SIZE] x_redirect_target;
+
+  logic f_req_accepted;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      f_req_accepted <= 1'b0;
+    end else if (x_redirect_taken || !f_stall) begin
+      f_req_accepted <= 1'b0;
+    end else if (imem.ARVALID && imem.ARREADY) begin
+      f_req_accepted <= 1'b1;
+    end
+  end
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -250,7 +261,7 @@ module DatapathPipelinedAxil (
     end else if (x_redirect_taken) begin
       f_pc_current   <= x_redirect_target;
       f_cycle_status <= CYCLE_NO_STALL;
-    end else if (g_stall) begin
+    end else if (f_stall) begin
       f_pc_current   <= f_pc_current;
       f_cycle_status <= f_cycle_status;
     end else begin
@@ -260,7 +271,7 @@ module DatapathPipelinedAxil (
   end
 
   assign imem.ARADDR  = f_pc_current;
-  assign imem.ARVALID = !g_stall && !x_redirect_taken && !rst && !halt;
+  assign imem.ARVALID = !f_req_accepted && !x_redirect_taken && !rst && !halt;
   assign imem.ARPROT  = 3'b0;
 
   // Unused write ports for imem
@@ -276,6 +287,13 @@ module DatapathPipelinedAxil (
   /* G STAGE     */
   /***************/
   stage_g_t g_state;
+
+  wire g_is_valid = (g_state.cycle_status == CYCLE_NO_STALL);
+  wire g_imem_wait = g_is_valid && !imem.RVALID;
+  wire f_ar_wait = imem.ARVALID && !imem.ARREADY;
+  assign g_stall = d_stall || g_imem_wait;
+  assign f_stall = g_stall || f_ar_wait;
+
   always_ff @(posedge clk) begin
     if (rst) begin
       g_state <= '{pc: 0, cycle_status: CYCLE_RESET};
@@ -283,15 +301,11 @@ module DatapathPipelinedAxil (
       g_state <= g_state;
     end else if (x_redirect_taken) begin
       g_state <= '{pc: 0, cycle_status: CYCLE_TAKEN_BRANCH};
-    end else if (d_stall) begin
+    end else if (g_stall) begin
       g_state <= g_state;
     end else begin
-      // if F was stalled in the previous cycle, the PC we tracked is f_pc_current.
-      // But notice if g_stall -> d_stall, g_state remains the same.
-      // actually, if x_redirect_taken we put a bubble.
-      // If we are here, neither x_redirect_taken nor d_stall is true.
-      if (f_cycle_status == CYCLE_TAKEN_BRANCH) begin
-        // bubble
+      // If F stalled (e.g., ARREADY=0) but G can advance, G gets a bubble.
+      if (f_cycle_status == CYCLE_TAKEN_BRANCH || f_stall) begin
         g_state <= '{pc: 0, cycle_status: CYCLE_TAKEN_BRANCH};
       end else begin
         g_state <= '{pc: f_pc_current, cycle_status: f_cycle_status};
@@ -299,7 +313,7 @@ module DatapathPipelinedAxil (
     end
   end
 
-  assign imem.RREADY = !d_stall;
+  assign imem.RREADY = !d_stall && !rst;
 
   // If a branch is taken, flush F, G, D. We handle F up there, G here, D below.
 
@@ -323,10 +337,16 @@ module DatapathPipelinedAxil (
       };
     end else if (d_stall) begin
       decode_state <= decode_state;
+    end else if (g_imem_wait) begin
+      decode_state <= '{
+        pc: g_state.pc,
+        insn: 32'b0,
+        cycle_status: CYCLE_IMEM_WAIT
+      };
     end else begin
       decode_state <= '{
         pc: g_state.pc,
-        insn: (g_state.cycle_status != CYCLE_NO_STALL) ? 32'h00000000 : imem.RDATA,
+        insn: g_is_valid ? imem.RDATA : 32'h00000000,
         cycle_status: g_state.cycle_status
       };
     end
