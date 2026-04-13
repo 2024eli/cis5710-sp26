@@ -331,7 +331,7 @@ module DatapathPipelinedAxil (
       };
     end else if (x_redirect_taken) begin
       decode_state <= '{
-        pc: g_state.pc,
+        pc: 0,
         insn: 32'b0,
         cycle_status: CYCLE_TAKEN_BRANCH
       };
@@ -339,7 +339,7 @@ module DatapathPipelinedAxil (
       decode_state <= decode_state;
     end else if (g_imem_wait) begin
       decode_state <= '{
-        pc: g_state.pc,
+        pc: 0,
         insn: 32'b0,
         cycle_status: CYCLE_IMEM_WAIT
       };
